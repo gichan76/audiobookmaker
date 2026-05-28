@@ -8,7 +8,6 @@ import time
 import base64
 import zipfile
 from gtts import gTTS
-import pyttsx3
 
 # ----------------- [강력한 텍스트 필터 기능] -----------------
 def apply_custom_filters(text):
@@ -166,16 +165,6 @@ def chunk_text(text, max_length=1000):
     if current_chunk: chunks.append(current_chunk.strip())
     return chunks
 
-@st.cache_data
-def get_pyttsx3_voices():
-    try:
-        e = pyttsx3.init()
-        return [v.name for v in e.getProperty('voices')]
-    except:
-        return ["기본 음성"]
-
-offline_voices = get_pyttsx3_voices()
-
 def create_download_link(audio_bytes, filename, btn_text):
     """실시간 개별 다운로드 HTML 버튼"""
     b64 = base64.b64encode(audio_bytes).decode()
@@ -192,7 +181,7 @@ def create_download_link(audio_bytes, filename, btn_text):
     '''
     return href
 
-# ----------------- [변환 + 실시간 링크 생성 + ZIP 압축 통합 로직] -----------------
+# ----------------- [변환 + 실시간 링크 생성 + ZIP 압축 로직] -----------------
 async def generate_and_display_audio(text, original_filename, engine_type, voice, rate, pitch, split_size, range_mode, target_num, speed_limit, progress_bar, status_text, links_container):
     big_chunks = create_file_chunks_with_overlap(text, max_length=split_size)
     total_files = len(big_chunks)
@@ -217,54 +206,34 @@ async def generate_and_display_audio(text, original_filename, engine_type, voice
             h, m = divmod(m, 60)
             status_text.info(f"⏳ [{file_idx}/{total_files}] 번째 파일 변환 중... (누적 시간: {h:02d}:{m:02d}:{s:02d})")
             
-            final_audio = b""
+            small_chunks = [c for c in chunk_text(big_chunk, max_length=1000) if c.strip()]
+            results = [None] * len(small_chunks)
             
-            if "오프라인" in engine_type:
-                temp_filename = f"temp_{file_idx}.mp3"
-                def run_pyttsx3():
-                    e = pyttsx3.init()
-                    for v in e.getProperty('voices'):
-                        if v.name == voice:
-                            e.setProperty('voice', v.id)
-                            break
-                    e.setProperty('rate', 200 + rate)
-                    e.save_to_file(big_chunk, temp_filename)
-                    e.runAndWait()
-                
-                await asyncio.to_thread(run_pyttsx3)
-                with open(temp_filename, "rb") as f:
-                    final_audio = f.read()
-                os.remove(temp_filename)
-                
-            else:
-                small_chunks = [c for c in chunk_text(big_chunk, max_length=1000) if c.strip()]
-                results = [None] * len(small_chunks)
-                
-                async def fetch_audio(i, chunk_text_part):
-                    for attempt in range(5):
-                        try:
-                            async with sem:
-                                if "Edge" in engine_type:
-                                    communicate = edge_tts.Communicate(chunk_text_part, voice, rate=rate_str, pitch=pitch_str)
-                                    audio_data = b""
-                                    async for chunk_data in communicate.stream():
-                                        if chunk_data["type"] == "audio":
-                                            audio_data += chunk_data["data"]
-                                    results[i] = audio_data
-                                elif "Google" in engine_type:
-                                    def get_gtts():
-                                        t = gTTS(chunk_text_part, lang='ko')
-                                        fp = io.BytesIO()
-                                        t.write_to_fp(fp)
-                                        return fp.getvalue()
-                                    results[i] = await asyncio.to_thread(get_gtts)
-                                return
-                        except Exception:
-                            await asyncio.sleep(1.5)
+            async def fetch_audio(i, chunk_text_part):
+                for attempt in range(5):
+                    try:
+                        async with sem:
+                            if "Edge" in engine_type:
+                                communicate = edge_tts.Communicate(chunk_text_part, voice, rate=rate_str, pitch=pitch_str)
+                                audio_data = b""
+                                async for chunk_data in communicate.stream():
+                                    if chunk_data["type"] == "audio":
+                                        audio_data += chunk_data["data"]
+                                results[i] = audio_data
+                            elif "Google" in engine_type:
+                                def get_gtts():
+                                    t = gTTS(chunk_text_part, lang='ko')
+                                    fp = io.BytesIO()
+                                    t.write_to_fp(fp)
+                                    return fp.getvalue()
+                                results[i] = await asyncio.to_thread(get_gtts)
+                            return
+                    except Exception:
+                        await asyncio.sleep(1.5)
 
-                tasks = [fetch_audio(i, chunk) for i, chunk in enumerate(small_chunks)]
-                await asyncio.gather(*tasks)
-                final_audio = b"".join(filter(None, results))
+            tasks = [fetch_audio(i, chunk) for i, chunk in enumerate(small_chunks)]
+            await asyncio.gather(*tasks)
+            final_audio = b"".join(filter(None, results))
             
             # 1. 파일 이름 설정
             filename = f"{original_filename}_{file_idx}.mp3"
@@ -285,33 +254,29 @@ async def generate_and_display_audio(text, original_filename, engine_type, voice
 st.set_page_config(page_title="오디오북 메이커", page_icon="🎧", layout="centered")
 
 st.title("🎧오디오북 메이커")
-st.markdown("txt파일을 tts를 이용해 mp3로 변환")
+st.markdown("TTS엔진을 이용한 txt파일 mp3 변환")
 
 uploaded_file = st.file_uploader("변환할 텍스트(TXT) 파일을 올려주세요", type=["txt"])
 
 st.markdown("### ⚙️ 상세 설정")
-engine_option = st.selectbox("0. TTS 엔진 선택", ["Edge TTS (최고음질/온라인)", "Google TTS (기본/온라인)", "PC 내장 (오프라인)"])
+engine_option = st.selectbox("0. TTS 엔진 선택", ["Edge TTS (최고음질)", "Google TTS (기본)"])
 
 col1, col2, col3 = st.columns(3)
 with col1:
     if "Edge" in engine_option:
-        # ★ '선히'를 '선희'로 자연스럽게 수정 적용 ★
         voice_option = st.selectbox("목소리", ["여성 (선희)", "남성 (인준)"])
         voice_code = "ko-KR-SunHiNeural" if voice_option == "여성 (선희)" else "ko-KR-InJoonNeural"
-    elif "Google" in engine_option:
+    else:
         voice_option = st.selectbox("목소리", ["한국어 (기본)"])
         voice_code = "한국어 (기본)"
-    else:
-        voice_option = st.selectbox("목소리", offline_voices)
-        voice_code = voice_option
 
 with col2:
     is_google = "Google" in engine_option
     rate = st.slider("말하기 속도", -100, 100, 0, disabled=is_google)
 
 with col3:
-    is_offline_or_google = "Google" in engine_option or "오프라인" in engine_option
-    pitch = st.slider("목소리 높낮이", -50, 50, 0, disabled=is_offline_or_google)
+    is_google = "Google" in engine_option
+    pitch = st.slider("목소리 높낮이", -50, 50, 0, disabled=is_google)
 
 col4, col5 = st.columns(2)
 with col4:
@@ -321,7 +286,7 @@ with col4:
     else: split_size = 200000
 
 with col5:
-    speed_option = st.selectbox("온라인 엔진 속도", ["안전 모드 (동시 5개)", "고속 모드 (동시 10개)"], disabled=("오프라인" in engine_option))
+    speed_option = st.selectbox("온라인 엔진 속도", ["안전 모드 (동시 5개)", "고속 모드 (동시 10개)"])
     speed_limit = 10 if "10개" in speed_option else 5
 
 col6, col7 = st.columns([2, 1])
@@ -373,20 +338,6 @@ if st.button("▶ 현재 설정으로 미리듣기"):
             buf = io.BytesIO()
             t.write_to_fp(buf)
             st.audio(buf.getvalue(), format="audio/mp3")
-            
-        elif "오프라인" in engine_option:
-            temp_prev = "preview_temp.mp3"
-            e = pyttsx3.init()
-            for v in e.getProperty('voices'):
-                if v.name == voice_code:
-                    e.setProperty('voice', v.id)
-                    break
-            e.setProperty('rate', 200 + rate)
-            e.save_to_file(sample_text, temp_prev)
-            e.runAndWait()
-            with open(temp_prev, "rb") as f:
-                st.audio(f.read(), format="audio/mp3")
-            os.remove(temp_prev)
 
 # 4. 전체 변환 시작
 if st.button("🚀 MP3 변환 시작", use_container_width=True):
@@ -396,12 +347,11 @@ if st.button("🚀 MP3 변환 시작", use_container_width=True):
         progress_bar = st.progress(0)
         status_text = st.empty()
         
-        st.markdown("### 📥 개별 파일 다운로드 목록")
-        # 개별 다운로드 버튼들이 차곡차곡 쌓일 빈 공간 생성
+        st.markdown("### 📥 다운로드 목록")
+        # 개별 다운로드 버튼
         links_container = st.container()
         
-        with st.spinner("엔진 가동 중... "):
-            # 변환 진행과 동시에 뒤에서 ZIP 파일로도 묶어두는 마법의 로직
+        with st.spinner("엔진 가동 중... 완성될 때마다 개별 다운로드 버튼이 생겨납니다!"):
             zip_data = asyncio.run(generate_and_display_audio(
                 filtered_text, original_filename, engine_option, voice_code, rate, pitch, split_size, range_mode, target_num, speed_limit, progress_bar, status_text, links_container
             ))
@@ -410,9 +360,8 @@ if st.button("🚀 MP3 변환 시작", use_container_width=True):
             
             st.markdown("---")
             st.markdown("### 📦 전체 파일 한 번에 다운로드")
-            st.success("모든 작업이 끝났습니다! 아래 버튼을 눌러 지금까지 만들어진 전체 파일을 하나로 묶어 받으실 수 있습니다.")
+            st.success("모든 작업이 끝났습니다! 전체 파일을 하나로 받으실 수 있습니다.")
             
-            # ★ 모든 작업이 끝난 후 나타나는 '전체 ZIP 다운로드' 버튼 ★
             st.download_button(
                 label=f"💾 [{original_filename}] 전체 파일 모음 (ZIP) 다운로드",
                 data=zip_data,
